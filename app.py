@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import sys
-import re
 import os
 import requests
 import time
@@ -15,96 +14,83 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 from transformers import pipeline
 import streamlit as st
 import torch
 import spacy
 from wordcloud import WordCloud
-import pandas as pd
-from collections import defaultdict
 
-# Fix inotify watch limit
-os.system('sysctl fs.inotify.max_user_watches=524288')
+# --- Permanent Fix for inotify Error ---
+os.environ['STREAMLIT_SERVER_ENABLE_WATCHER'] = 'false'  # Disable file watcher
+try:
+    os.system('echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf')
+    os.system('sudo sysctl -p')
+except Exception as e:
+    st.error(f"System configuration failed: {str(e)}")
 
-# --- Streamlit Page Config ---
+# --- Streamlit Config ---
 st.set_page_config(
-    page_title="National Park Review Analyzer",
+    page_title="Park Review Analyzer",
     page_icon="🏞️",
     layout="wide",
     menu_items={
         'Get Help': 'https://github.com/navyasreebandaru7/sentimental-analysis',
-        'About': "National Park Review Sentiment Analysis Tool"
+        'About': "Sentiment Analysis Tool for Park Reviews"
     }
 )
 
-# --- System Dependencies Check ---
+# --- Dependencies Check ---
 @st.cache_resource
-def check_system_deps():
+def check_dependencies():
     try:
         import distutils
         from selenium import webdriver
         return True
-    except (ImportError, ModuleNotFoundError) as e:
-        st.error(f"Missing system dependency: {str(e)}")
+    except ImportError as e:
+        st.error(f"Missing dependency: {str(e)}\n\nRun: sudo apt-get install python3-distutils")
         return False
 
-# --- Enhanced NLP Setup ---
+# --- NLP Setup ---
 @st.cache_resource
-def load_nlp_models():
+def load_nlp():
     try:
-        # Install spaCy model with user permissions
-        if not os.path.exists(os.path.expanduser('~/.local/lib/python3.12/site-packages/en_core_web_sm')):
-            os.system('python3 -m spacy download en_core_web_sm --user')
-            
         nlp = spacy.load("en_core_web_sm")
-        sentiment_analyzer = pipeline(
-            "sentiment-analysis", 
+        sentiment_pipeline = pipeline(
+            "sentiment-analysis",
             model="distilbert-base-uncased-finetuned-sst-2-english",
             device=0 if torch.cuda.is_available() else -1
         )
-        return nlp, sentiment_analyzer
+        return nlp, sentiment_pipeline
     except Exception as e:
-        st.error(f"Error initializing NLP: {str(e)}")
+        st.error(f"NLP initialization failed: {str(e)}")
         st.stop()
 
-nlp, sentiment_analyzer = load_nlp_models()
+nlp, sentiment_analyzer = load_nlp()
 
-# --- Constants ---
-CATEGORIES = {
-    'hiking': ['hiking', 'trail', 'hike'],
-    'fees': ['fee', 'price', 'cost'],
-    'facilities': ['restroom', 'bathroom', 'parking']
-}
-
-class ParkScraper:
+# --- Web Scraper Class ---
+class ReviewScraper:
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        })
+        self.options = Options()
+        self.options.add_argument("--headless=new")
+        self.options.add_argument("--no-sandbox")
+        self.options.add_argument("--disable-dev-shm-usage")
         
-    def extract_content(self, url):
+    def scrape_reviews(self, url):
         try:
-            chrome_options = Options()
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=self.options
+            )
             
             driver.get(url)
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, 'body'))
             )
             
-            # Simplified extraction logic
-            reviews = [elem.text for elem in driver.find_elements(By.CSS_SELECTOR, '.review, .comment')]
-            
+            reviews = [elem.text for elem in driver.find_elements(By.CSS_SELECTOR, '.review, .comment, [itemprop="review"]')]
             return {
-                'reviews': reviews,
+                'reviews': reviews[:100],  # Limit to 100 reviews
                 'title': driver.title
             }
         except Exception as e:
@@ -113,45 +99,44 @@ class ParkScraper:
             if 'driver' in locals():
                 driver.quit()
 
-def analyze_content(url):
-    scraper = ParkScraper()
-    data = scraper.extract_content(url)
-    
-    if 'error' in data:
-        return None, data['error']
-    
-    try:
-        sentiments = []
-        for review in data['reviews'][:100]:  # Limit to 100 reviews for stability
-            result = sentiment_analyzer(review[:512])[0]
-            sentiments.append(result)
-            
-        return {
-            'positive': len([s for s in sentiments if s['label'] == 'POSITIVE']),
-            'negative': len([s for s in sentiments if s['label'] == 'NEGATIVE']),
-            'total': len(sentiments)
-        }, None
-    except Exception as e:
-        return None, str(e)
+# --- Analysis Functions ---
+def perform_analysis(reviews):
+    results = []
+    for review in reviews:
+        try:
+            analysis = sentiment_analyzer(review[:512])[0]
+            results.append(analysis)
+        except Exception as e:
+            continue
+    return results
 
-# --- Streamlit Interface ---
+# --- Streamlit UI ---
 st.title("National Park Review Analyzer")
+url = st.text_input("Enter Review Page URL:", placeholder="https://example.com/park-reviews")
 
-url_input = st.text_input("Enter Park Review URL:", placeholder="https://example.com/reviews")
-
-if st.button("Analyze"):
-    if not check_system_deps():
+if st.button("Analyze Sentiment"):
+    if not check_dependencies():
         st.stop()
         
-    with st.spinner("Analyzing..."):
-        report, error = analyze_content(url_input)
+    with st.spinner("Analyzing reviews..."):
+        scraper = ReviewScraper()
+        data = scraper.scrape_reviews(url)
         
-        if error:
-            st.error(f"Error: {error}")
-        else:
-            st.success(f"Analyzed {report['total']} reviews")
-            st.write(f"Positive: {report['positive']}")
-            st.write(f"Negative: {report['negative']}")
+        if 'error' in data:
+            st.error(f"Scraping failed: {data['error']}")
+            st.stop()
+            
+        analysis = perform_analysis(data['reviews'])
+        positive = sum(1 for res in analysis if res['label'] == 'POSITIVE')
+        negative = len(analysis) - positive
+        
+        st.success(f"Analysis Complete ({len(analysis)} reviews processed)")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Positive Reviews", positive)
+        with col2:
+            st.metric("Negative Reviews", negative)
 
+# --- Requirements Section ---
 st.sidebar.markdown("""
 **System Requirements:**
