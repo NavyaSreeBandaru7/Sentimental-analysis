@@ -1,14 +1,20 @@
-streamlit==1.29.0
+""")
+
+st.sidebar.download_button(
+    "Download requirements.txt",
+    data="""streamlit==1.29.0
 selenium==4.16.0
 webdriver-manager==4.0.1
-requests==2.31.0
-beautifulsoup4==4.12.2
 transformers==4.35.2
 torch==2.2.0
 spacy==3.7.2
-python-dotenv==1.0.0
 matplotlib==3.8.2
 wordcloud==1.9.3
-pandas==2.2.0
-numpy==1.26.4
+requests==2.31.0
+beautifulsoup4==4.12.2
+python-dotenv==1.0.0
+""",
+    file_name="requirements.txt"
+)
+
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
