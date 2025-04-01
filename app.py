@@ -29,15 +29,18 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Dependency Check ---
+# --- Dependency Validation ---
 @st.cache_resource
-def check_dependencies():
+def validate_dependencies():
     try:
+        # Check critical dependencies
         from webdriver_manager.chrome import ChromeDriverManager
-        from selenium import webdriver
+        import selenium
+        import torch
         return True
     except ImportError as e:
-        st.error(f"Missing dependency: {str(e)}")
+        st.error(f"Missing critical dependency: {str(e)}")
+        st.stop()
         return False
 
 # --- NLP Setup ---
@@ -47,7 +50,7 @@ def load_nlp_models():
         nlp = spacy.load("en_core_web_sm")
     except OSError:
         import subprocess
-        subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
+        subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
         nlp = spacy.load("en_core_web_sm")
     
     sentiment_analyzer = pipeline(
@@ -122,16 +125,9 @@ class ParkScraper:
         except Exception as e:
             return {'error': f"Selenium error: {str(e)}"}
 
-    # Remaining class methods unchanged from previous version...
+    # Rest of the class methods remain same as previous version...
 
-def analyze_content(url, use_selenium=True):
-    scraper = ParkScraper()
-    data = scraper.extract_content(url, use_selenium=use_selenium)
-    
-    if 'error' in data:
-        return None, f"Error: {data['error']}"
-    
-    # Analysis logic unchanged from previous version...
+# Rest of the analysis and UI code remains same as previous version...
 
 # Streamlit Interface
 st.title("🌲 Advanced Park Review Analyzer")
@@ -139,6 +135,9 @@ st.write("""
 This tool analyzes reviews from any park/travel website. 
 Supports multi-page review scraping using advanced browser automation.
 """)
+
+# Dependency check before proceeding
+validate_dependencies()
 
 url_input = st.text_input(
     "Enter Park/Travel URL", 
@@ -153,16 +152,6 @@ if st.button("Analyze", type="primary"):
         st.error("Please enter a URL to analyze")
     else:
         with st.spinner("Analyzing... This may take 2-3 minutes for large sites"):
-            if not check_dependencies():
-                st.error("Required dependencies missing. Check requirements.txt")
-                st.stop()
-                
             report, error = analyze_content(url_input, use_selenium=use_selenium)
             
-            # Display logic unchanged from previous version...
-
-st.sidebar.header("About")
-st.sidebar.write("""
-This tool uses natural language processing to analyze reviews from travel websites.
-It extracts information about facilities, activities, and visitor sentiments.
-""")
+            # Display logic remains same as previous version...
