@@ -278,4 +278,5 @@ if st.button("Analyze Reviews", type="primary"):
                 st.pyplot(plt)
 
 st.sidebar.markdown("""
+**Installation Requirements:**
 
