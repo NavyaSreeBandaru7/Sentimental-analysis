@@ -3,6 +3,7 @@ import sys
 import re
 import os
 import requests
+import time
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -45,9 +46,14 @@ def load_nlp_models():
     # Check for spaCy model with proper permissions
     try:
         nlp = spacy.load("en_core_web_sm")
-    except (OSError, PermissionError):
-        st.error("spaCy model missing or permission issues. Install with:\n"
-                 "``````")
+    except (OSError, PermissionError) as e:
+        st.error(f"Error loading spaCy model: {str(e)}\n\n"
+                 "Install with:\n"
+                 "```
+                 "sudo chown -R $USER:$USER $HOME/.local/lib/python3.12/site-packages\n```")
+        return None, None
+    except Exception as e:
+        st.error(f"Unexpected error loading NLP models: {str(e)}")
         return None, None
     
     # Configure sentiment analyzer
@@ -59,7 +65,7 @@ def load_nlp_models():
         )
         return nlp, sentiment_analyzer
     except Exception as e:
-        st.error(f"Failed to initialize NLP models: {str(e)}")
+        st.error(f"Failed to initialize sentiment analyzer: {str(e)}")
         return None, None
 
 nlp, sentiment_analyzer = load_nlp_models()
@@ -68,11 +74,11 @@ if not nlp or not sentiment_analyzer:
 
 # --- Constants ---
 CATEGORIES = {
-    'hiking': ['hiking', 'trail', 'hike', 'trek', 'trekking', 'paths', 'walk', 'walking'],
-    'fees': ['fee', 'price', 'cost', 'payment', 'dollar', 'money', 'expensive', 'cheap', 'affordable'],
-    'equipment': ['equipment', 'gear', 'supplies', 'tent', 'backpack', 'boots', 'poles', 'shoes'],
-    'water': ['water', 'lake', 'river', 'stream', 'pond', 'waterfall', 'creek', 'swimming'],
-    'facilities': ['facilities', 'restroom', 'bathroom', 'shower', 'toilet', 'visitor center', 'parking']
+    'hiking': ['hiking', 'trail', 'hike', 'trek', 'paths', 'walk', 'walking'],
+    'fees': ['fee', 'price', 'cost', 'payment', 'dollar', 'money'],
+    'equipment': ['equipment', 'gear', 'tent', 'backpack', 'boots'],
+    'water': ['water', 'lake', 'river', 'stream', 'swimming'],
+    'facilities': ['restroom', 'bathroom', 'shower', 'toilet', 'parking']
 }
 
 class ParkScraper:
@@ -80,13 +86,12 @@ class ParkScraper:
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml',
             'Accept-Language': 'en-US,en;q=0.9'
         })
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
         
     def validate_url(self, url):
-        return True  # Domain restriction removed
+        return True
     
     def extract_content(self, url, use_selenium=True):
         if use_selenium:
@@ -99,14 +104,14 @@ class ParkScraper:
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--window-size=1920,1080")
             
             service = Service(ChromeDriverManager().install())
             driver = webdriver.Chrome(service=service, options=chrome_options)
             
             driver.get(url)
-            time.sleep(3)
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, 'body'))
+            )
             
             title = self._get_title(driver)
             reviews = self._paginated_review_extraction(driver)
@@ -128,10 +133,12 @@ class ParkScraper:
     def _paginated_review_extraction(self, driver):
         reviews = []
         page = 1
-        max_pages = 10
+        max_pages = 5  # Reduced for safety
         
         while page <= max_pages:
             current_reviews = self._get_page_reviews(driver)
+            if not current_reviews:
+                break
             reviews.extend(current_reviews)
             
             next_page = self._find_next_button(driver)
@@ -140,7 +147,9 @@ class ParkScraper:
                 
             try:
                 next_page.click()
-                time.sleep(2.5)
+                WebDriverWait(driver, 10).until(
+                    EC.staleness_of(next_page)
+                )
                 page += 1
             except Exception:
                 break
@@ -149,9 +158,8 @@ class ParkScraper:
 
     def _get_page_reviews(self, driver):
         selectors = [
-            '.rec-reviews-card', '.review-content',
-            '[data-component="review"]', '.review-card',
-            '.user-review', '.comment-item'
+            '.review', '.comment', '.testimonial',
+            '[itemprop="review"]', '.user-content'
         ]
         
         for selector in selectors:
@@ -162,22 +170,22 @@ class ParkScraper:
             except NoSuchElementException:
                 continue
                 
-        paragraphs = driver.find_elements(By.TAG_NAME, 'p')
-        return [p.text.strip() for p in paragraphs if len(p.text.strip()) > 50]
+        return []
 
     def _find_next_button(self, driver):
         next_selectors = [
-            'button[aria-label="Next page"]', 'a.pagination-next',
-            'li.next a', 'a.next', 'button.next',
-            '[data-testid="pagination-next"]'
+            'a[rel="next"]', '.pagination-next',
+            'button.next', '[aria-label="Next page"]'
         ]
         
         for selector in next_selectors:
             try:
-                button = driver.find_element(By.CSS_SELECTOR, selector)
-                if button.is_displayed() and button.is_enabled():
+                button = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                )
+                if button.is_enabled():
                     return button
-            except NoSuchElementException:
+            except:
                 continue
         return None
 
@@ -187,58 +195,87 @@ class ParkScraper:
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser')
             return {
-                'reviews': self._get_basic_reviews(soup),
-                'fees': self._extract_fees(soup),
-                'facilities': self._extract_facilities(soup),
-                'activities': self._extract_activities(soup),
-                'title': self._get_title(soup)
+                'reviews': [p.text.strip() for p in soup.select('p') if len(p.text.strip()) > 50],
+                'fees': [],
+                'facilities': [],
+                'activities': [],
+                'title': soup.title.text if soup.title else "Unknown Park"
             }
         except Exception as e:
             return {'error': str(e)}
-
-    # Remaining helper methods (_extract_fees, _extract_facilities, etc.)
-    # ... [Keep original helper methods unchanged] ...
 
 def analyze_content(url, use_selenium=True):
     scraper = ParkScraper()
     data = scraper.extract_content(url, use_selenium=use_selenium)
     
     if 'error' in data:
-        return None, f"Error: {data['error']}"
+        return None, data['error']
     
-    # Analysis logic remains unchanged
-    # ... [Keep original analysis logic] ...
+    try:
+        sentiments = []
+        for review in data['reviews']:
+            result = sentiment_analyzer(review[:512])[0]
+            sentiments.append({
+                'text': review,
+                'label': result['label'],
+                'score': result['score']
+            })
+        
+        return {
+            'sentiments': sentiments,
+            'metrics': {
+                'total_reviews': len(sentiments),
+                'positive': len([s for s in sentiments if s['label'] == 'POSITIVE']),
+                'negative': len([s for s in sentiments if s['label'] == 'NEGATIVE'])
+            },
+            **data
+        }, None
+    except Exception as e:
+        return None, f"Analysis error: {str(e)}"
 
-# Streamlit Interface
-st.title("🌲 Advanced Park Review Analyzer")
-st.write("""
-This tool analyzes reviews from any park/travel website. 
-Supports multi-page review scraping using advanced browser automation.
-""")
+# --- Streamlit Interface ---
+st.title("🌲 National Park Review Analyzer")
+st.write("## Comprehensive Review Analysis Tool")
 
 url_input = st.text_input(
-    "Enter Park/Travel URL", 
-    placeholder="https://www.example.com/park-reviews"
+    "Enter Park/Travel Review URL:",
+    placeholder="https://www.example.com/park-reviews",
+    help="Supports any travel/park review website"
 )
 
-use_selenium = st.checkbox("Enable Complete Review Scraping (Recommended)", value=True,
-                          help="Uses browser automation to scrape all review pages")
+use_selenium = st.checkbox(
+    "Enable Advanced Scraping (Recommended)",
+    value=True,
+    help="Uses browser automation for multi-page reviews"
+)
 
-if st.button("Analyze", type="primary"):
+if st.button("Analyze Reviews", type="primary"):
     if not url_input:
-        st.error("Please enter a URL to analyze")
+        st.error("Please enter a valid URL")
     else:
-        with st.spinner("Analyzing... This may take 2-3 minutes for large sites"):
-            report, error = analyze_content(url_input, use_selenium=use_selenium)
+        with st.spinner("Analyzing... This may take 1-2 minutes"):
+            report, error = analyze_content(url_input, use_selenium)
             
             if error:
-                st.error(error)
-            elif report:
-                # Display logic remains unchanged
-                # ... [Keep original display logic] ...
+                st.error(f"Analysis Failed: {error}")
+            else:
+                st.success(f"Analyzed {report['metrics']['total_reviews']} reviews")
+                
+                # Display metrics
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Positive Reviews", report['metrics']['positive'])
+                with col2:
+                    st.metric("Negative Reviews", report['metrics']['negative'])
+                
+                # Show word cloud
+                st.subheader("Common Themes")
+                text = ' '.join([r['text'] for r in report['sentiments']])
+                wordcloud = WordCloud(width=800, height=400).generate(text)
+                plt.figure(figsize=(10, 5))
+                plt.imshow(wordcloud)
+                plt.axis("off")
+                st.pyplot(plt)
 
-st.sidebar.header("About")
-st.sidebar.write("""
-This tool uses natural language processing to analyze reviews from travel websites.
-It extracts information about facilities, activities, and visitor sentiments.
-""")
+st.sidebar.markdown("""
+
