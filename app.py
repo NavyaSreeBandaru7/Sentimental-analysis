@@ -1,3 +1,5 @@
+# app.py
+# IMPORTANT: This import and page config must be first
 import streamlit as st
 
 # --- Streamlit Page Config (MUST BE FIRST) ---
@@ -748,3 +750,7 @@ def analyze_content(url, use_selenium=True):
                     # Plot bars for each sentiment
                     for i, sentiment in enumerate(['positive', 'neutral', 'negative']):
                         if sentiment in pivot_df.columns:
+                            bars = ax.bar(index + i*bar_width, pivot_df[sentiment], bar_width, 
+                                    label=sentiment, color=colors[sentiment])
+                            
+                            # Ad
