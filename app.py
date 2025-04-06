@@ -5,14 +5,11 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 from bs4 import BeautifulSoup
-from transformers import pipeline
 import streamlit as st
-import torch
-import spacy
-from wordcloud import WordCloud
 import pandas as pd
 from collections import defaultdict
-import sys
+import os
+import time
 
 # --- Streamlit Page Config (MUST BE FIRST) ---
 st.set_page_config(
@@ -21,36 +18,39 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- NLP Setup ---
+# --- Loading Models ---
 @st.cache_resource
 def load_nlp_models():
-    try:
-        # Try to load spacy model
+    with st.spinner("Loading models... (this may take a minute on first run)"):
+        import spacy
+        import torch
+        from transformers import pipeline
+        
+        # Load spacy model
         try:
             nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            import subprocess
-            st.info("Downloading language model for the first time...")
-            subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
-            nlp = spacy.load("en_core_web_sm")
+        except Exception as e:
+            st.warning(f"Spacy model loading error: {e}")
+            nlp = None
         
-        # Load sentiment analyzer with appropriate device
-        sentiment_analyzer = pipeline(
-            "sentiment-analysis", 
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-            device=0 if torch.cuda.is_available() else -1
-        )
+        # Load sentiment analyzer
+        try:
+            device = 0 if torch.cuda.is_available() else -1
+            sentiment_analyzer = pipeline(
+                "sentiment-analysis", 
+                model="distilbert-base-uncased-finetuned-sst-2-english",
+                device=device
+            )
+        except Exception as e:
+            st.warning(f"Transformer model loading error: {e}")
+            sentiment_analyzer = None
+            
         return nlp, sentiment_analyzer
-    except Exception as e:
-        st.error(f"Error loading NLP models: {str(e)}")
-        st.stop()
 
-# Load models with proper error handling
-try:
-    nlp, sentiment_analyzer = load_nlp_models()
-except Exception as e:
-    st.error(f"Failed to initialize NLP components: {str(e)}")
-    nlp, sentiment_analyzer = None, None
+# Only load models when needed
+if 'nlp' not in st.session_state:
+    st.session_state.nlp = None
+    st.session_state.sentiment_analyzer = None
 
 # --- Constants ---
 # Define categories for analysis
@@ -127,8 +127,11 @@ class WebScraper:
             r'(?:Fee|Price|Cost):\s*\$\d+\.?\d*'
         ]
         
-        for pattern in fee_patterns:
-            fees.extend(re.findall(pattern, soup.text))
+        try:
+            for pattern in fee_patterns:
+                fees.extend(re.findall(pattern, soup.text))
+        except Exception:
+            pass
         
         return fees[:5]  # Return up to 5 fee matches
     
@@ -137,15 +140,18 @@ class WebScraper:
         facility_keywords = ['restroom', 'shower', 'campsite', 'picnic', 'visitor center', 
                             'parking', 'trailhead', 'lodging', 'camping', 'cabin']
         
-        for keyword in facility_keywords:
-            if keyword.lower() in soup.text.lower():
-                facilities.append(keyword)
-                
-        # Also look for lists that might contain facilities
-        for list_item in soup.find_all('li'):
-            item_text = list_item.get_text(strip=True).lower()
-            if any(keyword in item_text for keyword in facility_keywords):
-                facilities.append(item_text[:50] + "..." if len(item_text) > 50 else item_text)
+        try:
+            for keyword in facility_keywords:
+                if keyword.lower() in soup.text.lower():
+                    facilities.append(keyword)
+                    
+            # Also look for lists that might contain facilities
+            for list_item in soup.find_all('li'):
+                item_text = list_item.get_text(strip=True).lower()
+                if any(keyword in item_text for keyword in facility_keywords):
+                    facilities.append(item_text[:50] + "..." if len(item_text) > 50 else item_text)
+        except Exception:
+            pass
         
         return list(set(facilities))[:5]  # Deduplicate and limit to 5
     
@@ -154,9 +160,12 @@ class WebScraper:
         activity_keywords = ['hiking', 'swimming', 'fishing', 'boating', 'camping', 
                             'wildlife viewing', 'biking', 'kayaking', 'canoeing', 'photography']
         
-        for keyword in activity_keywords:
-            if keyword.lower() in soup.text.lower():
-                activities.append(keyword)
+        try:
+            for keyword in activity_keywords:
+                if keyword.lower() in soup.text.lower():
+                    activities.append(keyword)
+        except Exception:
+            pass
         
         return list(set(activities))  # Deduplicate
 
@@ -185,6 +194,17 @@ def categorize_text(text):
     return categories_found
 
 def analyze_content(url):
+    # Ensure models are loaded
+    if st.session_state.nlp is None or st.session_state.sentiment_analyzer is None:
+        st.session_state.nlp, st.session_state.sentiment_analyzer = load_nlp_models()
+    
+    if st.session_state.sentiment_analyzer is None:
+        return None, "Error: Sentiment analysis model failed to load. Please try again."
+    
+    # Get sentiment analyzer
+    sentiment_analyzer = st.session_state.sentiment_analyzer
+    
+    # Scrape content
     scraper = WebScraper()
     data = scraper.extract_content(url)
     
@@ -199,8 +219,14 @@ def analyze_content(url):
     category_sentiments = defaultdict(list)
     sentences = []
     
-    # Process each review
-    for review in data['reviews']:
+    # Process each review with progress indication
+    progress_bar = st.progress(0)
+    total_reviews = len(data['reviews'])
+    
+    for i, review in enumerate(data['reviews']):
+        # Update progress
+        progress_bar.progress((i + 1) / total_reviews)
+        
         # Split review into sentences for more granular analysis
         review_sentences = re.split(r'(?<=[.!?])\s+', review)
         
@@ -243,7 +269,10 @@ def analyze_content(url):
                         category_sentiments[category].append(sentiment_entry)
                         
             except Exception as e:
-                return None, f"Sentiment analysis failed: {str(e)}"
+                pass  # Continue with other sentences if one fails
+    
+    # Clear progress bar
+    progress_bar.empty()
     
     if not all_sentiments:
         return None, "Error: Could not perform sentiment analysis."
@@ -363,8 +392,11 @@ def analyze_content(url):
     
     # 4. Word Cloud
     combined_text = ' '.join(data['reviews'])
+    wordcloud_fig = None
+    
     if combined_text:
         try:
+            from wordcloud import WordCloud
             wordcloud = WordCloud(width=800, height=400, background_color='white',
                                  colormap='viridis', max_words=100,
                                  contour_width=1).generate(combined_text)
@@ -375,10 +407,7 @@ def analyze_content(url):
             ax.axis('off')
             plt.tight_layout()
         except Exception as e:
-            wordcloud_fig = None
             st.warning(f"Could not generate word cloud: {str(e)}")
-    else:
-        wordcloud_fig = None
     
     # 5. Top Positive and Negative Sentences
     # Sort by confidence
@@ -449,112 +478,116 @@ if st.button("Analyze", type="primary"):
         st.error("Please enter a URL to analyze")
     else:
         with st.spinner("Analyzing... This may take a minute"):
-            report, error = analyze_content(url_input)
-            
-            if error:
-                st.error(error)
-            elif report:
-                # Display report
-                st.header(f"Analysis Report: {report['title']}")
+            try:
+                report, error = analyze_content(url_input)
                 
-                # Overall metrics
-                st.subheader("Overall Sentiment")
-                cols = st.columns(3)
-                
-                with cols[0]:
-                    st.metric("Positive", f"{report['positive_count']} ({report['positive_pct']:.1f}%)")
-                
-                with cols[1]:
-                    st.metric("Neutral", f"{report['neutral_count']} ({report['neutral_pct']:.1f}%)")
+                if error:
+                    st.error(error)
+                elif report:
+                    # Display report
+                    st.header(f"Analysis Report: {report['title']}")
                     
-                with cols[2]:
-                    st.metric("Negative", f"{report['negative_count']} ({report['negative_pct']:.1f}%)")
-                
-                # Display overall sentiment distribution
-                st.pyplot(report['overall_sentiment_fig'])
-                
-                # Display category sentiment distribution if available
-                if report['category_sentiment_fig']:
-                    st.subheader("Sentiment by Category")
-                    st.pyplot(report['category_sentiment_fig'])
+                    # Overall metrics
+                    st.subheader("Overall Sentiment")
+                    cols = st.columns(3)
                     
-                    # Show detailed category breakdown
-                    st.subheader("Category Details")
+                    with cols[0]:
+                        st.metric("Positive", f"{report['positive_count']} ({report['positive_pct']:.1f}%)")
                     
-                    for category in CATEGORIES.keys():
-                        if category in report['category_sentiments']:
-                            with st.expander(f"{category.title()} - {len(report['category_sentiments'][category])} mentions"):
-                                cat_sentiments = report['category_sentiments'][category]
-                                pos = sum(1 for s in cat_sentiments if s['sentiment'] == 'positive')
-                                neg = sum(1 for s in cat_sentiments if s['sentiment'] == 'negative')
-                                neu = sum(1 for s in cat_sentiments if s['sentiment'] == 'neutral')
-                                
-                                total = len(cat_sentiments)
-                                if total > 0:
-                                    st.write(f"👍 Positive: {pos} ({pos/total*100:.1f}%)")
-                                    st.write(f"👎 Negative: {neg} ({neg/total*100:.1f}%)")
-                                    st.write(f"😐 Neutral: {neu} ({neu/total*100:.1f}%)")
+                    with cols[1]:
+                        st.metric("Neutral", f"{report['neutral_count']} ({report['neutral_pct']:.1f}%)")
+                        
+                    with cols[2]:
+                        st.metric("Negative", f"{report['negative_count']} ({report['negative_pct']:.1f}%)")
+                    
+                    # Display overall sentiment distribution
+                    st.pyplot(report['overall_sentiment_fig'])
+                    
+                    # Display category sentiment distribution if available
+                    if report['category_sentiment_fig']:
+                        st.subheader("Sentiment by Category")
+                        st.pyplot(report['category_sentiment_fig'])
+                        
+                        # Show detailed category breakdown
+                        st.subheader("Category Details")
+                        
+                        for category in CATEGORIES.keys():
+                            if category in report['category_sentiments']:
+                                with st.expander(f"{category.title()} - {len(report['category_sentiments'][category])} mentions"):
+                                    cat_sentiments = report['category_sentiments'][category]
+                                    pos = sum(1 for s in cat_sentiments if s['sentiment'] == 'positive')
+                                    neg = sum(1 for s in cat_sentiments if s['sentiment'] == 'negative')
+                                    neu = sum(1 for s in cat_sentiments if s['sentiment'] == 'neutral')
                                     
-                                    # Show top sentence for this category
-                                    top_positive = next((s for s in cat_sentiments if s['sentiment'] == 'positive'), None)
-                                    top_negative = next((s for s in cat_sentiments if s['sentiment'] == 'negative'), None)
-                                    
-                                    if top_positive:
-                                        st.write("**Sample positive mention:**")
-                                        st.write(f"*\"{top_positive['text']}\"*")
-                                    
-                                    if top_negative:
-                                        st.write("**Sample negative mention:**")
-                                        st.write(f"*\"{top_negative['text']}\"*")
+                                    total = len(cat_sentiments)
+                                    if total > 0:
+                                        st.write(f"👍 Positive: {pos} ({pos/total*100:.1f}%)")
+                                        st.write(f"👎 Negative: {neg} ({neg/total*100:.1f}%)")
+                                        st.write(f"😐 Neutral: {neu} ({neu/total*100:.1f}%)")
+                                        
+                                        # Show top sentence for this category
+                                        top_positive = next((s for s in cat_sentiments if s['sentiment'] == 'positive'), None)
+                                        top_negative = next((s for s in cat_sentiments if s['sentiment'] == 'negative'), None)
+                                        
+                                        if top_positive:
+                                            st.write("**Sample positive mention:**")
+                                            st.write(f"*\"{top_positive['text']}\"*")
+                                        
+                                        if top_negative:
+                                            st.write("**Sample negative mention:**")
+                                            st.write(f"*\"{top_negative['text']}\"*")
+                            else:
+                                with st.expander(f"{category.title()} - 0 mentions"):
+                                    st.write("No mentions found for this category.")
+                    
+                    # Display confidence distribution
+                    st.subheader("Sentiment Confidence")
+                    st.pyplot(report['confidence_fig'])
+                    
+                    # Display word cloud
+                    if report['wordcloud']:
+                        st.subheader("Word Cloud")
+                        st.pyplot(report['wordcloud'])
+                    
+                    # Display top positive and negative sentences
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader("Top Positive Mentions")
+                        if report['top_positive']:
+                            for i, sentence in enumerate(report['top_positive'], 1):
+                                st.write(f"**{i}.** *\"{sentence['text']}\"* (Confidence: {sentence['confidence']:.2f})")
                         else:
-                            with st.expander(f"{category.title()} - 0 mentions"):
-                                st.write("No mentions found for this category.")
-                
-                # Display confidence distribution
-                st.subheader("Sentiment Confidence")
-                st.pyplot(report['confidence_fig'])
-                
-                # Display word cloud
-                if report['wordcloud']:
-                    st.subheader("Word Cloud")
-                    st.pyplot(report['wordcloud'])
-                
-                # Display top positive and negative sentences
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("Top Positive Mentions")
-                    if report['top_positive']:
-                        for i, sentence in enumerate(report['top_positive'], 1):
-                            st.write(f"**{i}.** *\"{sentence['text']}\"* (Confidence: {sentence['confidence']:.2f})")
-                    else:
-                        st.write("No positive mentions found.")
-                
-                with col2:
-                    st.subheader("Top Negative Mentions")
-                    if report['top_negative']:
-                        for i, sentence in enumerate(report['top_negative'], 1):
-                            st.write(f"**{i}.** *\"{sentence['text']}\"* (Confidence: {sentence['confidence']:.2f})")
-                    else:
-                        st.write("No negative mentions found.")
-                
-                # Display extracted information
-                st.subheader("Additional Information")
-                
-                if report['fees']:
-                    with st.expander("Fees Mentioned"):
-                        for fee in report['fees']:
-                            st.write(f"- {fee}")
-                
-                if report['facilities']:
-                    with st.expander("Facilities"):
-                        for facility in report['facilities']:
-                            st.write(f"- {facility}")
-                
-                if report['activities']:
-                    with st.expander("Activities"):
-                        for activity in report['activities']:
-                            st.write(f"- {activity}")
+                            st.write("No positive mentions found.")
+                    
+                    with col2:
+                        st.subheader("Top Negative Mentions")
+                        if report['top_negative']:
+                            for i, sentence in enumerate(report['top_negative'], 1):
+                                st.write(f"**{i}.** *\"{sentence['text']}\"* (Confidence: {sentence['confidence']:.2f})")
+                        else:
+                            st.write("No negative mentions found.")
+                    
+                    # Display extracted information
+                    st.subheader("Additional Information")
+                    
+                    if report['fees']:
+                        with st.expander("Fees Mentioned"):
+                            for fee in report['fees']:
+                                st.write(f"- {fee}")
+                    
+                    if report['facilities']:
+                        with st.expander("Facilities"):
+                            for facility in report['facilities']:
+                                st.write(f"- {facility}")
+                    
+                    if report['activities']:
+                        with st.expander("Activities"):
+                            for activity in report['activities']:
+                                st.write(f"- {activity}")
+            except Exception as e:
+                st.error(f"An error occurred during analysis: {str(e)}")
+                st.info("Try with a different URL or try again later.")
 
 st.sidebar.header("About")
 st.sidebar.write("""
@@ -575,4 +608,4 @@ st.sidebar.write("- Generates word clouds")
 
 # Add version information
 st.sidebar.divider()
-st.sidebar.caption("Version 1.0.0")
+st.sidebar.caption("Version 1.1.0")
