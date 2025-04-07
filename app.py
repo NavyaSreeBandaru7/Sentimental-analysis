@@ -21,17 +21,33 @@ import pandas as pd
 from collections import defaultdict
 import time
 import warnings
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
-from wordcloud import WordCloud
-import seaborn as sns
 import json
 import traceback
+
+# Optional imports with fallbacks
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    selenium_available = True
+except ImportError:
+    selenium_available = False
+    st.warning("Selenium is not available. Simple web scraping will be used.")
+
+try:
+    from wordcloud import WordCloud
+    wordcloud_available = True
+except ImportError:
+    wordcloud_available = False
+    st.warning("WordCloud is not available. Word cloud visualization will be skipped.")
+
+try:
+    import seaborn as sns
+    seaborn_available = True
+except ImportError:
+    seaborn_available = False
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -67,7 +83,7 @@ def load_nlp_models():
                     if torch.cuda.is_available():
                         device = 0
                     
-                    # Use a more recent model that works with updated PyTorch
+                    # Use a compatible model
                     sentiment_analyzer = pipeline(
                         "sentiment-analysis", 
                         model="distilbert-base-uncased-finetuned-sst-2-english",
@@ -98,9 +114,12 @@ CATEGORIES = {
     'facilities': ['facilities', 'restroom', 'bathroom', 'shower', 'toilet', 'visitor center', 'parking', 'campground', 'campsite', 'bench', 'picnic', 'wifi', 'signal']
 }
 
-# Selenium WebDriver setup with caching
+# Selenium WebDriver setup with caching if available
 @st.cache_resource
 def get_webdriver():
+    if not selenium_available:
+        return None
+        
     try:
         chrome_options = Options()
         chrome_options.add_argument("--headless")
@@ -110,7 +129,20 @@ def get_webdriver():
         chrome_options.add_argument("--window-size=1920,1080")
         chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
         
-        driver = webdriver.Chrome(options=chrome_options)
+        # Different initialization methods based on environment
+        try:
+            # Try using ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        except:
+            try:
+                # Try using system installed chromedriver
+                driver = webdriver.Chrome(options=chrome_options)
+            except:
+                # Final fallback for containers where Chrome is installed in specific location
+                chrome_options.binary_location = "/usr/bin/chromium"
+                driver = webdriver.Chrome(options=chrome_options)
+                
         return driver
     except Exception as e:
         st.error(f"Error initializing WebDriver: {str(e)}")
@@ -125,10 +157,10 @@ class WebScraper:
             'Accept-Language': 'en-US,en;q=0.9'
         })
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
-        self.use_selenium = use_selenium
+        self.use_selenium = use_selenium and selenium_available
         self.driver = None
         
-        if use_selenium:
+        if self.use_selenium:
             self.driver = get_webdriver()
     
     def __del__(self):
@@ -243,7 +275,7 @@ class WebScraper:
                 try:
                     # Find the next page button
                     next_button = self.driver.find_element(By.CSS_SELECTOR, ".nav.next")
-                    if next_button and next_button.is_enabled():
+                    if next_button.is_enabled():
                         next_button.click()
                         time.sleep(3)
                         
@@ -323,8 +355,11 @@ class WebScraper:
             # Scroll to load more reviews
             scroll_attempts = 0
             while scroll_attempts < 5:  # Limit scrolls to avoid infinite loop
-                self.driver.execute_script("document.querySelector('div[role=\"feed\"]').scrollTop += 1000")
-                time.sleep(1)
+                try:
+                    self.driver.execute_script("document.querySelector('div[role=\"feed\"]').scrollTop += 1000")
+                    time.sleep(1)
+                except:
+                    pass
                 scroll_attempts += 1
             
             # Extract review elements
@@ -562,24 +597,41 @@ def categorize_text(text):
         
     return categories_found
 
+# Simple sentiment analysis function when transformer model isn't available
+def simple_sentiment_analysis(text):
+    """Basic sentiment analysis using keyword matching"""
+    positive_words = ['good', 'great', 'excellent', 'amazing', 'wonderful', 'best', 'love', 'enjoy', 'recommend',
+                     'beautiful', 'perfect', 'awesome', 'fantastic', 'favorite', 'lovely', 'happy', 'pleased',
+                     'worth', 'nice', 'fun', 'impressed', 'clean', 'friendly', 'helpful']
+                     
+    negative_words = ['bad', 'terrible', 'awful', 'worst', 'poor', 'disappointing', 'avoid', 'waste', 'not worth',
+                     'dirty', 'rude', 'expensive', 'overpriced', 'crowded', 'disappointed', 'horrible', 'boring',
+                     'uncomfortable', 'difficult', 'problem', 'issues', 'never again', 'wouldn\'t recommend']
+    
+    text_lower = text.lower()
+    positive_matches = sum(1 for word in positive_words if word in text_lower)
+    negative_matches = sum(1 for word in negative_words if word in text_lower)
+    
+    if positive_matches > negative_matches:
+        return {
+            'label': 'POSITIVE',
+            'score': min(0.5 + (positive_matches * 0.05), 0.95)
+        }
+    elif negative_matches > positive_matches:
+        return {
+            'label': 'NEGATIVE',
+            'score': min(0.5 + (negative_matches * 0.05), 0.95)
+        }
+    else:
+        return {
+            'label': 'NEUTRAL',
+            'score': 0.5
+        }
+
 def analyze_content(url, use_selenium=True):
     """Main analysis function with error handling and fallback options"""
     try:
-        # Make sure models are loaded
-        if st.session_state.nlp is None or st.session_state.sentiment_analyzer is None:
-            nlp, sentiment_analyzer = load_nlp_models()
-            st.session_state.nlp = nlp
-            st.session_state.sentiment_analyzer = sentiment_analyzer
-        
-        # Check if models loaded correctly
-        if st.session_state.sentiment_analyzer is None:
-            st.warning("⚠️ Could not load sentiment analysis model. Using simplified analysis.")
-            return simplified_analysis(url, use_selenium)
-        
-        # Get sentiment analyzer
-        sentiment_analyzer = st.session_state.sentiment_analyzer
-        
-        # Scrape content
+        # Scrape content first (do this before loading models to save time if scraping fails)
         scraper = WebScraper(use_selenium=use_selenium)
         data = scraper.extract_content(url)
         
@@ -588,6 +640,15 @@ def analyze_content(url, use_selenium=True):
         
         if not data['reviews']:
             return None, "Error: No content found to analyze on the page."
+        
+        # Now load models (only if we have content to analyze)
+        if st.session_state.nlp is None or st.session_state.sentiment_analyzer is None:
+            nlp, sentiment_analyzer = load_nlp_models()
+            st.session_state.nlp = nlp
+            st.session_state.sentiment_analyzer = sentiment_analyzer
+        
+        # Get sentiment analyzer (may be None if loading failed)
+        sentiment_analyzer = st.session_state.sentiment_analyzer
         
         # Prepare for analysis
         all_sentiments = []
@@ -614,12 +675,13 @@ def analyze_content(url, use_selenium=True):
                 # Determine categories this sentence belongs to
                 sentence_categories = categorize_text(sentence)
                 
-                # Break long sentences into chunks for the sentiment analyzer
-                try:
-                    text_chunks = [sentence[i:i+512] for i in range(0, len(sentence), 512)]
-                    
-                    for chunk in text_chunks:
-                        try:
+                # Break long sentences into chunks
+                text_chunks = [sentence[i:i+512] for i in range(0, len(sentence), 512)]
+                
+                for chunk in text_chunks:
+                    try:
+                        # Use transformer model if available, otherwise use simple approach
+                        if sentiment_analyzer:
                             sentiment_result = sentiment_analyzer(chunk)[0]
                             sentiment_label = sentiment_result['label']
                             confidence = sentiment_result['score']
@@ -628,25 +690,29 @@ def analyze_content(url, use_selenium=True):
                             if 0.55 <= confidence <= 0.70:
                                 sentiment_label = 'NEUTRAL'
                                 confidence = 0.5 + (confidence - 0.55) * 0.5
-                            
-                            # Store the sentiment
-                            standardized_label = map_sentiment_label(sentiment_label)
-                            sentiment_entry = {
-                                'text': chunk,
-                                'sentiment': standardized_label,
-                                'confidence': confidence,
-                                'categories': sentence_categories
-                            }
-                            
-                            all_sentiments.append(sentiment_entry)
-                            
-                            # Categorize by topics
-                            for category in sentence_categories:
-                                category_sentiments[category].append(sentiment_entry)
-                        except Exception as e:
-                            pass
-                except Exception as e:
-                    pass
+                        else:
+                            # Use simpler sentiment analysis as fallback
+                            result = simple_sentiment_analysis(chunk)
+                            sentiment_label = result['label']
+                            confidence = result['score']
+                        
+                        # Store the sentiment
+                        standardized_label = map_sentiment_label(sentiment_label)
+                        sentiment_entry = {
+                            'text': chunk,
+                            'sentiment': standardized_label,
+                            'confidence': confidence,
+                            'categories': sentence_categories
+                        }
+                        
+                        all_sentiments.append(sentiment_entry)
+                        
+                        # Categorize by topics
+                        for category in sentence_categories:
+                            category_sentiments[category].append(sentiment_entry)
+                    except Exception as e:
+                        st.warning(f"Error analyzing text chunk: {str(e)}")
+                        continue
         
         # Clear progress bar
         progress_bar.empty()
@@ -695,62 +761,3 @@ def analyze_content(url, use_selenium=True):
             colors = {'positive': '#4CAF50', 'neutral': '#FFC107', 'negative': '#F44336'}
             overall_sentiment_fig = plt.figure(figsize=(10, 6))
             ax = overall_sentiment_fig.add_subplot(111)
-            
-            # Sort sentiment counts to always show positive, neutral, negative in that order
-            ordered_sentiment_counts = pd.Series([
-                sentiment_counts.get('positive', 0),
-                sentiment_counts.get('neutral', 0),
-                sentiment_counts.get('negative', 0)
-            ], index=['positive', 'neutral', 'negative'])
-            
-            bars = ax.bar(
-                ordered_sentiment_counts.index, 
-                ordered_sentiment_counts.values, 
-                color=[colors[s] for s in ordered_sentiment_counts.index]
-            )
-            
-            ax.set_title('Overall Sentiment Distribution', fontsize=16)
-            ax.set_ylabel('Number of Text Segments', fontsize=12)
-            ax.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            # Add counts as text on bars
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                        f'{int(height)}', ha='center', va='bottom')
-            
-            plt.tight_layout()
-        except Exception as e:
-            st.error(f"Error creating overall sentiment chart: {str(e)}")
-            overall_sentiment_fig = None
-        
-        # 2. Sentiment Distribution by Category
-        try:
-            cat_fig = None
-            if category_sentiments:
-                # First check if we have any non-general categories
-                non_general_categories = [cat for cat in category_sentiments.keys() if cat != 'general']
-                
-                # If no categories other than general, no need for this chart
-                if non_general_categories:
-                    # Pivot the data for easier plotting
-                    pivot_df = category_df.pivot_table(index='category', columns='sentiment', values='count', fill_value=0)
-                    
-                    # Sort categories by total mentions (descending)
-                    category_totals = pivot_df.sum(axis=1).sort_values(ascending=False)
-                    pivot_df = pivot_df.loc[category_totals.index]
-                    
-                    cat_fig = plt.figure(figsize=(12, 7))
-                    ax = cat_fig.add_subplot(111)
-                    
-                    # Set width of bars
-                    bar_width = 0.25
-                    index = np.arange(len(pivot_df.index))
-                    
-                    # Plot bars for each sentiment
-                    for i, sentiment in enumerate(['positive', 'neutral', 'negative']):
-                        if sentiment in pivot_df.columns:
-                            bars = ax.bar(index + i*bar_width, pivot_df[sentiment], bar_width, 
-                                    label=sentiment, color=colors[sentiment])
-                            
-                            # Ad
